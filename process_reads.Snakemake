@@ -1,0 +1,176 @@
+import os
+import glob
+import pandas as pd
+import yaml
+import sys
+
+
+#module load snakemake/v8.27.1
+#module load samtools/1.20_gcc_12.3.0
+
+configfile: "evd_ml_processing.yaml"
+
+
+print("Config keys:", config.keys())
+
+
+sample_df=pd.read_csv(config["filenames"],sep='\t',header=0)
+sample_nm=sample_df.sm_nm
+
+
+print(sample_nm)
+
+rule all:
+    input:
+        expand(f"{config['input_fastq']}/{{sample}}.EVADE.trimmed.3p.trimmed.5p.fastq", sample=sample_nm),
+        expand(f"{config['bam_dir']}/{{sample}}_EVADE.bam", sample=sample_nm),
+        expand(f"{config['mp_EVD_logout']}/{{sample}}.35SEVDMapped.log", sample=sample_nm),
+        expand(f"{config['EVD_fa_out']}/{{sample}}.35SEVD.fasta", sample=sample_nm),
+        expand(f"{config['filt_bam']}/{{sample}}_EVADE.mapped.sorted.bam", sample=sample_nm),
+        expand(f"{config['filt_bam']}/{{sample}}_EVADE.mapped.sorted.bam.bai", sample=sample_nm),
+        expand(f"{config['bigwig_dir']}/{{sample}}_EVADE.plus.bw", sample=sample_nm),
+        expand(f"{config['bigwig_dir']}/{{sample}}_EVADE.minus.bw", sample=sample_nm),
+        expand(f"{config['bedgraph_dir']}/{{sample}}_EVADE.plus.bedgraph", sample=sample_nm),
+        expand(f"{config['bedgraph_dir']}/{{sample}}_EVADE.minus.bedgraph", sample=sample_nm),
+        expand(f"{config['bed_dir']}/{{sample}}_EVADE.bed12", sample=sample_nm),
+        expand(f"{config['EVD_fa_out']}/{{sample}}_35SEVD_3p5ptr_features_out.txt", sample=sample_nm)
+        
+
+
+
+
+rule minimap2_map:
+    input:
+        in_fa=f"{config['input_fastq']}/{{sample}}.EVADE.trimmed.3p.trimmed.5p.fastq"
+    output:
+        bam=f"{config['bam_dir']}/{{sample}}_EVADE.bam",
+        fasta_out=f"{config['EVD_fa_out']}/{{sample}}.35SEVD.fasta"
+    params:
+        EVD_ref=f"{config['genome_path']}/35S_EVD_ref.fa"
+    log:
+        mm_log=f"{config['mp_EVD_logout']}/{{sample}}.35SEVDMapped.log"
+    resources:
+        mem_mb=64000 #fails with 16GB
+    threads: 16
+    shell:"""
+        module load minimap2/2.28_gcc_12.3.0
+        module load samtools/1.20_gcc_12.3.0
+        set -euo pipefail
+
+        mkdir -p {config[map_EVD_dir]}
+        mkdir -p {config[bam_dir]}
+        mkdir -p {config[mp_EVD_logout]}
+        mkdir -p {config[EVD_fa_out]}
+
+        
+        minimap2 -t {threads} -G5k -ax splice "{params.EVD_ref}" "{input.in_fa}" 2> {log.mm_log} | samtools view -u - > {output.bam}
+
+        samtools view -h -b -F 4 {output.bam} --threads {threads} | samtools fasta - > {output.fasta_out}
+
+        
+        
+        """
+
+
+
+
+rule filter_bam:
+    input:
+        in_bam=f"{config['bam_dir']}/{{sample}}_EVADE.bam"
+    output:
+        bam_mapped=f"{config['filt_bam']}/{{sample}}_EVADE.mapped.sorted.bam",
+        bam_index=f"{config['filt_bam']}/{{sample}}_EVADE.mapped.sorted.bam.bai"
+    resources:
+        mem_mb=128000 #fails with 16GB
+    threads: 16
+    shell:"""
+        module load minimap2/2.28_gcc_12.3.0
+        module load samtools/1.20_gcc_12.3.0
+       
+
+        mkdir -p {config[filt_bam]}
+        
+        samtools view -h -b -F 4 {input.in_bam} --threads {threads} | samtools sort -o {output.bam_mapped}
+        samtools index {output.bam_mapped} {output.bam_index}
+        
+        """
+
+
+
+#bamCoverage -b reads.bam -o coverage.bw
+#--filterRNAstrand : forward, reverse
+#--normalizeUsing
+#Possible choices: RPKM, CPM, BPM, RPGC, None
+
+rule DT_cov_bw:
+    input:
+        input_bam=f"{config['filt_bam']}/{{sample}}_EVADE.mapped.sorted.bam"
+    output:
+        pls_bw=f"{config['bigwig_dir']}/{{sample}}_EVADE.plus.bw",
+        mns_bw=f"{config['bigwig_dir']}/{{sample}}_EVADE.minus.bw",
+        pls_bgr=f"{config['bedgraph_dir']}/{{sample}}_EVADE.plus.bedgraph",
+        mns_bgr=f"{config['bedgraph_dir']}/{{sample}}_EVADE.minus.bedgraph"
+    resources:
+        mem_mb=64000 
+    threads: 16
+    shell:"""
+        module load deeptools/3.5.5
+
+        mkdir -p {config[cov_dir]}
+        mkdir -p {config[bigwig_dir]}
+        mkdir -p {config[bedgraph_dir]}
+
+        
+        bamCoverage -p {threads} -b {input.input_bam} --outFileFormat bigwig --filterRNAstrand reverse --normalizeUsing CPM --binSize 10 -o {output.pls_bw}
+        bamCoverage -p {threads} -b {input.input_bam} --outFileFormat bigwig --filterRNAstrand forward --normalizeUsing CPM --binSize 10 -o {output.mns_bw}
+        bamCoverage -p {threads} -b {input.input_bam} --outFileFormat bedgraph --filterRNAstrand reverse --normalizeUsing CPM --binSize 10 -o {output.pls_bgr}
+        bamCoverage -p {threads} -b {input.input_bam} --outFileFormat bedgraph --filterRNAstrand forward --normalizeUsing CPM --binSize 10 -o {output.mns_bgr}
+
+        
+        """
+
+
+
+
+
+rule bam_to_bed12:
+    input:
+        input_bam=f"{config['filt_bam']}/{{sample}}_EVADE.mapped.sorted.bam"
+    output:
+        bed12_out=f"{config['bed_dir']}/{{sample}}_EVADE.bed12"
+    resources:
+        mem_mb=64000 
+    threads: 16
+    shell:"""
+        mkdir -p {config[bed_dir]}
+        
+        bedtools bamtobed -i {input.input_bam} -bed12 > {output.bed12_out}
+
+        """
+
+
+
+#samp=f"{{sample}}"
+rule make_feature:
+    input:
+        fa_dir=f"{config['EVD_fa_out']}",
+        fasta=f"{config['EVD_fa_out']}/{{sample}}.35SEVD.fasta",
+        
+    output:
+        out_FE=f"{config['EVD_fa_out']}/{{sample}}_35SEVD_3p5ptr_features_out.txt"
+    params:
+        script='/cluster/pixstor/slotkinr-lab/sandaruwan/EVD_ml/scripts/gen_features.py',
+        transgene="35SEVD"
+    resources:
+        mem_mb=16000 
+    threads: 8
+    shell:"""
+        
+        python {params.script} -F {input.fa_dir} -S {wildcards.sample} -T {params.transgene}
+        
+    
+
+        """
+
+
+#FE_dir: "/cluster/pixstor/slotkinr-lab/sandaruwan/EVD_ml/04_seq_FE_dir"
